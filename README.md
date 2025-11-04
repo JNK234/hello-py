@@ -10,7 +10,7 @@ Setup instructions:
 
 2. Navigate to the project directory:
    ```
-   cd rl-env-engineer-dataset-processing
+   cd hello-py
    ```
 
 3. Set up `ANTHROPIC_API_KEY` environment variable or add it to .env file:
