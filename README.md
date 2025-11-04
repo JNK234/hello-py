@@ -5,7 +5,7 @@ Setup instructions:
 
 1. Clone the repository:
    ```
-   git clone https://github.com/preferencemodel/rl-env-engineer-dataset-processing.git
+   git clone https://github.com/JNK234/hello-py.git
    ```
 
 2. Navigate to the project directory:
