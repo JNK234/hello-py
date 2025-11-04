@@ -12,7 +12,16 @@ import pandas as pd
 from anthropic import AsyncAnthropic
 from anthropic.types import MessageParam, ToolUnionParam
 
-api_key = ""
+from dotenv import load_dotenv
+load_dotenv()
+
+api_key = os.getenv("ANTHROPIC_API_KEY")
+if not api_key:
+    raise ValueError("ANTHROPIC_API_KEY environment variable not set")
+
+import warnings
+warnings.filterwarnings("ignore")
+
 
 BASE_DIR = Path(__file__).parent
 DATASET_URL = "https://archive.ics.uci.edu/ml/machine-learning-databases/00222/bank-additional/bank-additional-full.csv"
@@ -245,9 +254,6 @@ async def run_agent_loop(
     max_steps: int = 20,
     verbose: bool = False,
 ) -> Any | None:
-    # api_key = os.getenv("ANTHROPIC_API_KEY")
-    # if not api_key:
-    #     raise ValueError("ANTHROPIC_API_KEY environment variable not set")
 
     client = AsyncAnthropic(api_key=api_key)
     messages: list[MessageParam] = [{"role": "user", "content": prompt}]
@@ -391,43 +397,28 @@ async def main(concurrent: bool = True):
     }
 
     prompt = f"""
-You are a machine learning engineer preparing a dataset for production model training. Your goal is to perform thorough data cleaning, outlier detection, and set up proper stratified cross-validation to ensure reliable model evaluation.
+You are a machine learning engineer preparing a dataset for production model training. Your goal is to perform data cleaning, remove unrealistic outliers, and set up stratified cross-validation to ensure reliable model evaluation.
 
 DATASET: {RAW_DATA_PATH}
 A dataset with demographic and behavioral features, plus a binary target variable for classification.
 
+Ensure your cleaned dataset satisfies all of the following:
+- no missing values or placeholder tokens such as '?', 'unknown', 999, 999999, or -999
+- ages stay within [0, 120]; incomes are positive and not sentinel values; contact-related counts are non-negative and at most 100
+- duplicate rows are removed while the binary target column remains 0/1 only
+- fold assignments run from 0 to 4 and keep the target rate within ±15% of the overall rate
+
 1. EXPLORATORY DATA ANALYSIS (EDA)
-Start by thoroughly understanding the dataset structure and identifying all data quality issues:
-
-a) Load and understand structure
-
-b) Systematically check for issues in each column:
-   - Missing values
-   - Sentinel/placeholder values
-   - Duplicates
-   - Outliers: Examine numeric columns for unrealistic values (e.g., impossible ages, negative values where they shouldn't be)
-   - Target column
-
+Inspect the dataset to locate every violation of the required cleaned dataset properties.
 
 2. DATA CLEANING
-Fix the issues you identified, one by one, in a systematic way:
+Resolve each issue you identified: impute or drop missing values, handle sentinel placeholders, and remove duplicate rows without disturbing the target column.
 
-3. OUTLIER DETECTION AND REMOVAL
-Systematically identify and remove outliers from numeric columns:
-
-a) Examine each numeric column (except target and fold):
-b) Apply outlier detection methods
-c) Remove outlier rows
-
+3. OUTLIER REMOVAL
+Treat values outside the specified ranges as outliers. Remove or cap them so the final dataset satisfies the constraints for every numeric column other than target and fold.
 
 4. STRATIFIED 5-FOLD CROSS-VALIDATION
-After all cleaning is complete, create validation folds:
-
-a) Prepare the cleaned dataset
-b) Create stratified folds
-c) Add fold column
-d) Verify stratification
-
+After cleaning, create stratified folds labeled 0-4 that maintain the overall target rate within the allowed tolerance.
 
 5. Save and submit:
    - Save the cleaned dataset with fold column as '{RAW_DATA_PATH.stem}_cleaned.csv'
