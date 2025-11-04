@@ -8,3 +8,10 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Environment and secrets
+.env
+
+# Generated output files from task runs
+*_cleaned.csv
+*_cleaned_run*.csv

@@ -1,70 +1,255 @@
+import ast
 import asyncio
 import json
 from contextlib import redirect_stdout
 from io import StringIO
-from typing import Any, Callable, TypedDict
-
+from pathlib import Path
+from typing import Any, Callable
+from urllib.request import urlretrieve
+import os
+import numpy as np
+import pandas as pd
 from anthropic import AsyncAnthropic
 from anthropic.types import MessageParam, ToolUnionParam
 
+api_key = ""
 
-class PythonExpressionToolResult(TypedDict):
-    result: Any
-    error: str | None
+BASE_DIR = Path(__file__).parent
+DATASET_URL = "https://archive.ics.uci.edu/ml/machine-learning-databases/00222/bank-additional/bank-additional-full.csv"
+RAW_DATA_PATH = BASE_DIR / "messy_data.csv"
+TOOL_STATE: dict[str, Any] | None = None
 
-
-class SubmitAnswerToolResult(TypedDict):
-    answer: Any
-    submitted: bool
-
-
-def python_expression_tool(expression: str) -> PythonExpressionToolResult:
-    """
-    Tool that evaluates Python expressions using exec.
-    Use print(...) to emit output; stdout will be captured and returned.
-    """
+def ensure_dataset() -> Path:
+    if RAW_DATA_PATH.exists():
+        return RAW_DATA_PATH
     try:
-        namespace = {}
+        urlretrieve(DATASET_URL, RAW_DATA_PATH)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to download dataset: {exc}")
+    return RAW_DATA_PATH
+
+
+def create_python_tool() -> Callable[[str], dict[str, Any]]:
+    global TOOL_STATE
+    
+    # Import sklearn for the model
+    try:
+        from sklearn.model_selection import StratifiedKFold
+        sklearn_available = StratifiedKFold
+    except ImportError:
+        sklearn_available = None
+    
+    state: dict[str, Any] = {
+        "pd": pd,
+        "np": np,
+        "Path": Path,
+        "RAW_DATA_PATH": str(RAW_DATA_PATH),
+        "DATASET_URL": DATASET_URL,
+        "CSV_SEP": ",",
+        "BASE_DIR": str(BASE_DIR),
+        "StratifiedKFold": sklearn_available,
+    }
+    TOOL_STATE = state
+
+    def python_expression_tool(expression: str) -> dict[str, Any]:
         stdout = StringIO()
-        with redirect_stdout(stdout):
-            exec(expression, namespace, namespace)
-        return {"result": stdout.getvalue(), "error": None}
-    except KeyboardInterrupt:
-        raise
+        try:
+            with redirect_stdout(stdout):
+                exec(expression, state, state)
+            return {"stdout": stdout.getvalue(), "error": None}
+        except Exception as exc:
+            return {"stdout": stdout.getvalue(), "error": repr(exc)}
+
+    return python_expression_tool
+
+
+def submit_answer_tool(answer: Any) -> dict[str, Any]:
+    coerced = coerce_submission(answer)
+    return {"answer": coerced, "submitted": True}
+
+
+def download_dataset_tool() -> dict[str, Any]:
+    try:
+        path = ensure_dataset()
+        size = path.stat().st_size if path.exists() else 0
+        return {"path": str(path), "size_bytes": int(size)}
+    except Exception as exc:
+        return {"error": repr(exc)}
+
+
+def coerce_submission(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, str):
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                candidate = parser(payload)
+            except Exception:
+                continue
+            if isinstance(candidate, dict):
+                return candidate
+        if TOOL_STATE is not None:
+            try:
+                candidate = eval(payload, {"__builtins__": {}}, TOOL_STATE)
+                if isinstance(candidate, dict):
+                    return candidate
+            except Exception:
+                pass
+    return payload
+
+
+def grade_submission(result: Any) -> bool:
+    result = coerce_submission(result)
+
+    if not isinstance(result, dict):
+        print("FAIL: submission must be a dict")
+        return False
+
+    cleaned_path = result.get("cleaned_csv")
+    if not isinstance(cleaned_path, str):
+        print("FAIL: cleaned_csv must be a string path")
+        return False
+
+    cleaned_file = (BASE_DIR / cleaned_path).resolve()
+    if not cleaned_file.exists():
+        print("FAIL: cleaned CSV file does not exist")
+        return False
+
+    # Load cleaned data
+    try:
+        df = pd.read_csv(cleaned_file)
     except Exception as e:
-        return {"result": None, "error": str(e)}
+        print(f"FAIL: could not load cleaned CSV: {e}")
+        return False
 
+    # Check has reasonable amount of data (at least some data for ML)
+    if len(df) < 30:
+        print(f"FAIL: cleaned data has only {len(df)} rows, too few for meaningful cross-validation")
+        return False
 
-def submit_answer_tool(answer: Any) -> SubmitAnswerToolResult:
-    """
-    Tool for submitting the final answer.
-    """
-    return {"answer": answer, "submitted": True}
+    # Check 'fold' column exists
+    if 'fold' not in df.columns:
+        print("FAIL: cleaned data must have a 'fold' column")
+        return False
+
+    # Check 'target' column exists
+    if 'target' not in df.columns:
+        print("FAIL: cleaned data must have a 'target' column")
+        return False
+
+    # Validate no missing values
+    if df.isnull().any().any():
+        print("FAIL: cleaned data contains missing values (NaN)")
+        return False
+
+    # Validate target is binary
+    unique_targets = sorted(df['target'].unique())
+    if unique_targets != [0, 1]:
+        print(f"FAIL: target must be binary 0 and 1, found: {unique_targets}")
+        return False
+
+    # Validate fold column has exactly 5 folds (0-4)
+    unique_folds = sorted(df['fold'].unique())
+    if unique_folds != [0, 1, 2, 3, 4]:
+        print(f"FAIL: fold column must have values 0,1,2,3,4, found: {unique_folds}")
+        return False
+
+    # Check for common sentinel/placeholder values in numeric columns
+    for col in df.select_dtypes(include=[np.number]).columns:
+        if col in ['target', 'fold']:
+            continue
+        # Check for obvious sentinel values
+        if (df[col] == 999).any() or (df[col] == 999999).any() or (df[col] == -999).any():
+            print(f"FAIL: column '{col}' contains sentinel values (999, 999999, or -999)")
+            return False
+
+    # Check for placeholder values in string columns
+    for col in df.select_dtypes(include=['object']).columns:
+        if (df[col] == '?').any():
+            print(f"FAIL: column '{col}' contains '?' placeholder values")
+            return False
+        if (df[col].str.lower() == 'unknown').any():
+            print(f"FAIL: column '{col}' contains 'unknown' placeholder values")
+            return False
+
+    for col in df.select_dtypes(include=[np.number]).columns:
+        if col in ['target', 'fold']:
+            continue
+            
+        if 'age' in col.lower():
+            if (df[col] < 0).any() or (df[col] > 120).any():
+                print(f"FAIL: {col} contains unrealistic values (found values < 0 or > 120)")
+                return False
+        
+        elif 'income' in col.lower() or 'salary' in col.lower():
+            if (df[col] <= 0).any():
+                print(f"FAIL: {col} contains invalid values (must be positive)")
+                return False
+        
+        elif 'day' in col.lower() or 'time' in col.lower():
+            if (df[col] < 0).any():
+                print(f"FAIL: {col} contains negative values (time cannot be negative)")
+                return False
+            if (df[col] > 1000).any():
+                print(f"FAIL: {col} contains unrealistic values (> 1000 days)")
+                return False
+        
+        elif 'contact' in col.lower() or 'previous' in col.lower() or 'campaign' in col.lower():
+            if (df[col] < 0).any():
+                print(f"FAIL: {col} contains negative values (counts cannot be negative)")
+                return False
+            if (df[col] > 100).any():
+                print(f"FAIL: {col} contains unrealistic values (> 100 contacts)")
+                return False
+        
+        else:
+            # Check for obviously invalid negative values in columns that should be positive
+            if (df[col] < -100).any():
+                print(f"FAIL: {col} contains extreme negative values")
+                return False
+            # Check for suspiciously large values (likely data errors)
+            if (df[col] > 1000000).any():
+                print(f"FAIL: {col} contains extreme outlier values (> 1,000,000)")
+                return False
+
+    # Check stratification: each fold should have similar target distribution
+    overall_pos_ratio = (df['target'] == 1).mean()
+    
+    for fold_num in range(5):
+        fold_data = df[df['fold'] == fold_num]
+        
+        if len(fold_data) == 0:
+            print(f"FAIL: fold {fold_num} is empty")
+            return False
+        
+        fold_pos_ratio = (fold_data['target'] == 1).mean()
+        
+        # Check stratification (allow 15% deviation)
+        if abs(fold_pos_ratio - overall_pos_ratio) > 0.15:
+            print(f"FAIL: fold {fold_num} is not stratified (ratio {fold_pos_ratio:.3f} vs overall {overall_pos_ratio:.3f})")
+            return False
+
+    # Check no duplicate rows (excluding fold column)
+    df_without_fold = df.drop(columns=['fold'])
+    if df_without_fold.duplicated().any():
+        print("FAIL: cleaned data contains duplicate rows")
+        return False
+
+    return True
 
 
 async def run_agent_loop(
     prompt: str,
     tools: list[ToolUnionParam],
-    tool_handlers: dict[str, Callable[..., Any]],
+    handlers: dict[str, Callable[[Any], dict[str, Any]]],
     max_steps: int = 20,
-    model: str = "claude-3-5-haiku-latest",
-    verbose: bool = True,
+    verbose: bool = False,
 ) -> Any | None:
-    """
-    Runs an agent loop with the given prompt and tools.
+    # api_key = os.getenv("ANTHROPIC_API_KEY")
+    # if not api_key:
+    #     raise ValueError("ANTHROPIC_API_KEY environment variable not set")
 
-    Args:
-        prompt: The initial prompt for the agent
-        tools: List of tool definitions for Anthropic API
-        tool_handlers: Dictionary mapping tool names to their handler functions
-        max_steps: Maximum number of steps before stopping (default 5)
-        model: The Anthropic model to use
-        verbose: Whether to print detailed output (default True)
-
-    Returns:
-        The submitted answer if submit_answer was called, otherwise None
-    """
-    client = AsyncAnthropic()
+    client = AsyncAnthropic(api_key=api_key)
     messages: list[MessageParam] = [{"role": "user", "content": prompt}]
 
     for step in range(max_steps):
@@ -72,131 +257,112 @@ async def run_agent_loop(
             print(f"\n=== Step {step + 1}/{max_steps} ===")
 
         response = await client.messages.create(
-            model=model, max_tokens=1000, tools=tools, messages=messages
+            model="claude-3-5-haiku-latest",
+            max_tokens=2000,
+            tools=tools,
+            messages=messages,
         )
 
-        # Track if we need to continue
-        has_tool_use = False
         tool_results = []
-        submitted_answer = None
+        submitted = None
 
-        # Process the response
         for content in response.content:
-            if content.type == "text":
-                if verbose:
-                    print(f"Assistant: {content.text}")
+            if content.type == "text" and verbose:
+                print(content.text)
             elif content.type == "tool_use":
-                has_tool_use = True
                 tool_name = content.name
+                tool_input = content.input if isinstance(content.input, dict) else {}
+                handler = handlers.get(tool_name)
+                if not handler:
+                    continue
 
-                if tool_name in tool_handlers:
+                if tool_name == "python_expression":
+                    expr = tool_input.get("expression", "")
                     if verbose:
-                        print(f"Using tool: {tool_name}")
+                        print(f"\n[{tool_name} input]\n{expr}")
+                    result = handler(expr)
+                elif tool_name == "submit_answer":
+                    answer = tool_input.get("answer")
+                    result = handler(answer)
+                    submitted = result["answer"]
+                else:
+                    result = handler(**tool_input)
 
-                    # Extract arguments based on tool
-                    handler = tool_handlers[tool_name]
-                    tool_input = content.input
+                if verbose:
+                    print(f"[{tool_name} output]\n{result}")
 
-                    # Call the appropriate tool handler
-                    if tool_name == "python_expression":
-                        assert (
-                            isinstance(tool_input, dict) and "expression" in tool_input
-                        )
-                        if verbose:
-                            print("\nInput:")
-                            print("```")
-                            for line in tool_input["expression"].split("\n"):
-                                print(f"{line}")
-                            print("```")
-                        result = handler(tool_input["expression"])
-                        if verbose:
-                            print("\nOutput:")
-                            print("```")
-                            print(result)
-                            print("```")
-                    elif tool_name == "submit_answer":
-                        assert isinstance(tool_input, dict) and "answer" in tool_input
-                        result = handler(tool_input["answer"])
-                        submitted_answer = result["answer"]
-                    else:
-                        # Generic handler call
-                        result = (
-                            handler(**tool_input)
-                            if isinstance(tool_input, dict)
-                            else handler(tool_input)
-                        )
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": content.id,
+                        "content": json.dumps(result, default=lambda x: int(x) if hasattr(x, "__int__") else str(x)),
+                    }
+                )
 
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": content.id,
-                            "content": json.dumps(result),
-                        }
-                    )
-
-        # If we have tool uses, add them to the conversation
-        if has_tool_use:
+        if tool_results:
             messages.append({"role": "assistant", "content": response.content})
-
             messages.append({"role": "user", "content": tool_results})
 
-            # If an answer was submitted, return it
-            if submitted_answer is not None:
-                if verbose:
-                    print(f"\nAgent submitted answer: {submitted_answer}")
-                return submitted_answer
-        else:
-            # No tool use, conversation might be complete
-            if verbose:
-                print("\nNo tool use in response, ending loop.")
-            break
+        if submitted is not None:
+            return submitted
 
-    if verbose:
-        print(f"\nReached maximum steps ({max_steps}) without submitting answer.")
     return None
 
 
-async def run_single_test(
-    run_id: int,
-    num_runs: int,
-    prompt: str,
-    tools: list[ToolUnionParam],
-    tool_handlers: dict[str, Callable[..., Any]],
-    expected_answer: Any,
-    verbose: bool = False,
-) -> tuple[int, bool, Any]:
-    if verbose:
-        print(f"\n\n{'=' * 20} RUN {run_id}/{num_runs} {'=' * 20}")
-
-    result = await run_agent_loop(
-        prompt=prompt,
-        tools=tools,
-        tool_handlers=tool_handlers,
-        max_steps=5,
-        verbose=verbose,
+async def run_single_test(run_id: int, prompt: str, tools: list, handlers: dict, verbose: bool = False):
+    # Create unique prompt per run to avoid file conflicts
+    unique_prompt = prompt.replace(
+        f"{RAW_DATA_PATH.stem}_cleaned.csv",
+        f"{RAW_DATA_PATH.stem}_cleaned_run{run_id}.csv"
     )
+    
+    result = await run_agent_loop(unique_prompt, tools, handlers, verbose=verbose)
 
-    success = result == expected_answer
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except Exception:
+            pass
 
-    if success:
-        print(f"✓ Run {run_id}: SUCCESS - Got {result}")
-    else:
-        print(f"✗ Run {run_id}: FAILURE - Got {result}, expected {expected_answer}")
-
-    return run_id, success, result
+    success = grade_submission(result)
+    status = "✓ SUCCESS" if success else "✗ FAILURE"
+    print(f"Run {run_id:2d}: {status}")
+    
+    # Cleanup: remove the unique file after grading
+    if result and isinstance(result, dict):
+        cleaned_path = result.get("cleaned_csv")
+        if cleaned_path:
+            try:
+                (BASE_DIR / cleaned_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+    
+    return run_id, success
 
 
 async def main(concurrent: bool = True):
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("ERROR: Set ANTHROPIC_API_KEY in your environment before running the harness.")
+        return
+
+    ensure_dataset()
+
     tools: list[ToolUnionParam] = [
         {
+            "name": "download_dataset",
+            "description": "Check if dataset exists at RAW_DATA_PATH and return path info",
+            "input_schema": {"type": "object", "properties": {}},
+        },
+        {
             "name": "python_expression",
-            "description": "Evaluates a Python expression",
+            "description": "Execute Python code. State persists. RAW_DATA_PATH points to the raw CSV.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "expression": {
                         "type": "string",
-                        "description": "Will be passed to exec(). Use print() to output something. Returns stdout. ",
+                        "description": "Python code to exec(). Use prints for feedback; outputs persist in the session namespace.",
                     }
                 },
                 "required": ["expression"],
@@ -204,70 +370,91 @@ async def main(concurrent: bool = True):
         },
         {
             "name": "submit_answer",
-            "description": "Submit the final answer",
+            "description": "Submit your final cleaned CSV filename",
             "input_schema": {
                 "type": "object",
-                "properties": {"answer": {"description": "The final answer to submit"}},
+                "properties": {
+                    "answer": {
+                        "description": "Dict with 'cleaned_csv' key containing the filename",
+                        "type": "object"
+                    }
+                },
                 "required": ["answer"],
             },
         },
     ]
 
-    tool_handlers = {
-        "python_expression": python_expression_tool,
+    handlers = {
+        "download_dataset": lambda: download_dataset_tool(),
+        "python_expression": create_python_tool(),
         "submit_answer": submit_answer_tool,
     }
 
-    # Run the test 10 times and track success rate
+    prompt = f"""
+You are a machine learning engineer preparing a dataset for production model training. Your goal is to perform thorough data cleaning, outlier detection, and set up proper stratified cross-validation to ensure reliable model evaluation.
+
+DATASET: {RAW_DATA_PATH}
+A dataset with demographic and behavioral features, plus a binary target variable for classification.
+
+1. EXPLORATORY DATA ANALYSIS (EDA)
+Start by thoroughly understanding the dataset structure and identifying all data quality issues:
+
+a) Load and understand structure
+
+b) Systematically check for issues in each column:
+   - Missing values
+   - Sentinel/placeholder values
+   - Duplicates
+   - Outliers: Examine numeric columns for unrealistic values (e.g., impossible ages, negative values where they shouldn't be)
+   - Target column
+
+
+2. DATA CLEANING
+Fix the issues you identified, one by one, in a systematic way:
+
+3. OUTLIER DETECTION AND REMOVAL
+Systematically identify and remove outliers from numeric columns:
+
+a) Examine each numeric column (except target and fold):
+b) Apply outlier detection methods
+c) Remove outlier rows
+
+
+4. STRATIFIED 5-FOLD CROSS-VALIDATION
+After all cleaning is complete, create validation folds:
+
+a) Prepare the cleaned dataset
+b) Create stratified folds
+c) Add fold column
+d) Verify stratification
+
+
+5. Save and submit:
+   - Save the cleaned dataset with fold column as '{RAW_DATA_PATH.stem}_cleaned.csv'
+   - Call submit_answer with: {{"cleaned_csv": "{RAW_DATA_PATH.stem}_cleaned.csv"}}
+
+TOOLS:
+Use python_expression tool to execute Python code. pandas, numpy, and sklearn are available. State persists across tool calls. RAW_DATA_PATH variable contains the dataset path.
+""".strip()
+
     num_runs = 10
-    expected_answer = 8769
-    prompt = "Calculate (2^10 + 3^5) * 7 - 100. Use the python_expression tool and then submit the answer."
-
-    execution_mode = "concurrently" if concurrent else "sequentially"
-    print(f"Running {num_runs} test iterations {execution_mode}...")
-    print("=" * 60)
-
-    # Create all test coroutines
     tasks = [
-        run_single_test(
-            run_id=i + 1,
-            num_runs=num_runs,
-            prompt=prompt,
-            tools=tools,
-            tool_handlers=tool_handlers,
-            expected_answer=expected_answer,
-            verbose=False,
-        )
+        run_single_test(i + 1, prompt, tools, handlers, verbose=(i == 0))
         for i in range(num_runs)
     ]
 
-    # Run concurrently or sequentially based on the flag
     if concurrent:
-        # Process results as they complete
-        results = []
-        for coro in asyncio.as_completed(tasks):
-            result = await coro
-            results.append(result)
+        results = [await coro for coro in asyncio.as_completed(tasks)]
     else:
-        # Run sequentially by awaiting each task in order
-        results = []
-        for task in tasks:
-            result = await task
-            results.append(result)
+        results = [await task for task in tasks]
 
-    # Count successes
-    successes = sum(1 for _, success, _ in results)
-
-    # Calculate and display pass rate
-    pass_rate = (successes / num_runs) * 100
-    print(f"\n{'=' * 60}")
-    print("Test Results:")
-    print(f"  Passed: {successes}/{num_runs}")
-    print(f"  Failed: {num_runs - successes}/{num_runs}")
-    print(f"  Pass Rate: {pass_rate:.1f}%")
-    print(f"{'=' * 60}")
+    successes = sum(1 for _, ok in results if ok)
+    print("=" * 60)
+    print(f"Passed: {successes}/{num_runs}")
+    print(f"Failed: {num_runs - successes}/{num_runs}")
+    print(f"Pass Rate: {successes / num_runs * 100:.1f}% (target 10-40%)")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
-    # Set to True for concurrent execution, False for sequential execution
     asyncio.run(main(concurrent=True))
